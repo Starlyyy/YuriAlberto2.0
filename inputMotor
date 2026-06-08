@@ -1,0 +1,63 @@
+struct Motor {
+  byte direcao;
+  byte velocidade;
+};
+
+enum Direcao {
+  PARADO,
+  FRENTE,
+  TRAS
+};
+
+// Definição dos motores
+Motor motorEsquerdo = {A1, A2};
+Motor motorDireito = {A3, A4}; //motor B
+
+const int velocidade = 255;
+
+void setup() {
+  
+  pinMode(motorEsquerdo.direcao, OUTPUT);
+  pinMode(motorEsquerdo.velocidade, OUTPUT);
+  pinMode(motorDireito.direcao, OUTPUT);
+  pinMode(motorDireito.velocidade, OUTPUT);
+
+}
+
+void loop() {
+  
+  girarMotor(motorEsquerdo, velocidade, FRENTE);
+  girarMotor(motorDireito, velocidade, FRENTE); 
+  delay(3000);
+
+  girarMotor(motorEsquerdo, velocidade, TRAS);  
+  girarMotor(motorDireito, velocidade, TRAS); 
+  delay(3000);
+
+}
+
+void girarMotor(Motor motor, byte velocidade, Direcao direcao) {
+
+  switch (direcao) {
+
+    case FRENTE:
+      // pinoA em HIGH
+      // PWM no pinoB: 0 = máximo, 255 = mínimo
+      digitalWrite(motor.direcao, HIGH);
+      analogWrite(motor.velocidade, 255 - velocidade);
+      break;
+
+    case TRAS:
+      // pinoB em LOW
+      // PWM no pinoA: 255 = máximo, 0 = mínimo
+      digitalWrite(motor.direcao, LOW);
+      analogWrite(motor.velocidade, velocidade);
+      break;
+
+    case PARADO:
+    default:
+      digitalWrite(motor.direcao, LOW);
+      digitalWrite(motor.velocidade, LOW);
+      break;
+  }
+}
