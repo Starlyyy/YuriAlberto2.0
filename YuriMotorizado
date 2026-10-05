@@ -1,0 +1,257 @@
+#include <QTRSensors.h>
+
+QTRSensors qtr;
+
+const uint8_t SensorCount = 8;
+uint16_t sensorValues[SensorCount];
+
+// =============================
+// TB6612FNG
+// =============================
+
+#define PWMA 3
+#define AIN1 8
+#define AIN2 9
+
+#define PWMB 5
+#define BIN1 7
+#define BIN2 6
+
+//#define STBY 4
+
+// =============================
+// SENSOR DE PARADA (MARCADOR D13)
+// =============================
+#define PIN_SENSOR_PARADA 13
+#define SINAL_MARCA LOW  // Nível lógico ao detectar a marca (se o seu sensor enviar HIGH ao detectar, mude para HIGH)
+
+const int TOTAL_MARCAS = 8;
+const unsigned long TEMPO_PARADA_MS = 100;  // 1 segundo após a 8ª marca
+
+int contadorMarcas = 0;
+int estadoSensorAnterior = HIGH;
+unsigned long tempoUltimaMarca = 0;
+bool contagemFinalizada = false;
+unsigned long tempoAtingiu8 = 0;
+
+// ==============================================================================
+// TABELA DE PERFIS DE VELOCIDADE E PID
+// ==============================================================================
+// Use esta tabela como referência para alternar ou ajustar o comportamento:
+//
+// PERFIL 1 (Seguro / Travado) : Base = 160 | Max = 235 | Min = -60  | Kp = 0.042 | Ki = 0.0 | Kd = 0.380 -> Ultra estável, não erra nunca
+// PERFIL 2 (Rápido e Estável) : Base = 190 | Max = 255 | Min = -70  | Kp = 0.044 | Ki = 0.0 | Kd = 0.420 -> O que você acabou de testar!
+// PERFIL 3 (MÁXIMO SEM BAMBEAR): Base = 215 | Max = 255 | Min = -80  | Kp = 0.048 | Ki = 0.0 | Kd = 0.470 -> [ATIVO AGORA]
+// PERFIL 4 (Extremo / Pista lisa): Base = 230 | Max = 255 | Min = -100 | Kp = 0.052 | Ki = 0.0 | Kd = 0.540 -> Limite da aderência física
+// ==============================================================================
+
+// --- VARIÁVEIS ATIVAS (PERFIL 3 - MÁXIMA VELOCIDADE ESTÁVEL) ---
+float Kp = 0.049;   // Ganho Proporcional
+float Ki = 0.00;  // Ganho Integral
+float Kd = 0.460;   // Ganho Derivativo
+
+// Velocidades:
+int velocidadeBase = 220;  // Velocidade Base ativa
+int velocidadeMax = 255;   // Limite máximo de PWM
+int velocidadeMin = -90;  // Limite de rotação reversa
+
+int erroAnterior = 0;
+float integral = 0;
+
+// Zona morta: quando o erro for menor que esse valor, considera centralizado
+const int ZONA_MORTA = 50;
+
+
+// =============================
+// SETUP
+// =============================
+
+void setup() {
+  Serial.begin(115200);
+
+  // QTR
+  qtr.setTypeAnalog();
+  qtr.setSensorPins(
+    (const uint8_t[]){
+      A0, A1, A2, A3,
+      A4, A5, A6, A7 },
+    SensorCount);
+
+  // TB6612FNG
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+
+  pinMode(PWMB, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  // Pino do sensor de parada
+  pinMode(PIN_SENSOR_PARADA, INPUT);
+
+  parar();
+
+  // =============================
+  // CALIBRAÇÃO
+  // =============================
+  // NOTA: Como o D13 agora é a entrada do sensor de parada, não o usamos como saída (LED_BUILTIN)
+  Serial.println("CALIBRANDO (Passe o sensor sobre a linha e o fundo)...");
+
+  for (uint16_t i = 0; i < 300; i++) {
+    qtr.calibrate();
+    delay(5);
+  }
+
+  // Registra o estado inicial do sensor
+  estadoSensorAnterior = digitalRead(PIN_SENSOR_PARADA);
+
+  Serial.println("CALIBRACAO CONCLUIDA! Robô iniciando...");
+  delay(1000);
+}
+
+
+// =============================
+// LOOP PRINCIPAL (CONTROLE RÁPIDO)
+// =============================
+
+void loop() {
+  // 1. VERIFICAÇÃO DE PARADA FINAL (1s após a 8ª marca)
+  if (contagemFinalizada && (millis() - tempoAtingiu8 >= TEMPO_PARADA_MS)) {
+    parar();
+    Serial.println("8 marcas atingidas + 1 segundo decorrido. Robô parado!");
+    while (true) {
+      parar();  // Trava a execução mantendo motores desligados
+    }
+  }
+
+  // 2. LEITURA E CONTAGEM DO SENSOR DE PARADA (D13)
+  int leituraSensor = digitalRead(PIN_SENSOR_PARADA);
+
+  // Detecta a transição de entrada na marca (apenas 1 contagem por passagem)
+  if (leituraSensor == SINAL_MARCA && estadoSensorAnterior != SINAL_MARCA) {
+    if (millis() - tempoUltimaMarca > 100) {  // Filtro de 100ms para evitar falsas leituras na mesma marca
+      contadorMarcas++;
+      tempoUltimaMarca = millis();
+
+      Serial.print("Passagem detectada! Contagem: ");
+      Serial.println(contadorMarcas);
+
+      // Ao atingir a 8ª marca, inicia o contador de 1 segundo
+      if (contadorMarcas >= TOTAL_MARCAS && !contagemFinalizada) {
+        contagemFinalizada = true;
+        tempoAtingiu8 = millis();
+        Serial.println("8ª marca atingida! Parando em 1 segundo...");
+      }
+    }
+  }
+  estadoSensorAnterior = leituraSensor;
+
+  // 3. SEGUIDOR DE LINHA (PID)
+  uint16_t position = qtr.readLineWhite(sensorValues);
+
+  int erro = position - 3500;
+
+  if (abs(erro) < ZONA_MORTA) {
+    erro = 0;
+  }
+
+  // =============================
+  // CÁLCULO DO CONTROLE PID
+  // =============================
+
+  int derivada = erro - erroAnterior;
+
+  if (Ki > 0.0) {
+    integral += erro;
+    integral = constrain(integral, -3000, 3000);
+  } else {
+    integral = 0;
+  }
+
+  float correcao = (Kp * erro) + (Ki * integral) + (Kd * derivada);
+
+  erroAnterior = erro;
+
+  // =============================
+  // VELOCIDADE DIFERENCIAL DOS MOTORES
+  // =============================
+
+  int motorEsquerdo = velocidadeBase + correcao;
+  int motorDireito = velocidadeBase - correcao;
+
+  motorEsquerdo = constrain(motorEsquerdo, velocidadeMin, velocidadeMax);
+  motorDireito = constrain(motorDireito, velocidadeMin, velocidadeMax);
+
+  moverMotorA(motorEsquerdo);
+  moverMotorB(motorDireito);
+
+  // ===============================================
+  // TELEMETRIA SERIAL NÃO-BLOQUEANTE (A cada 150ms)
+  // ===============================================
+  static unsigned long ultimoPrint = 0;
+  if (millis() - ultimoPrint >= 150) {
+    ultimoPrint = millis();
+    Serial.print("Pos: ");
+    Serial.print(position);
+    Serial.print(" | Erro: ");
+    Serial.print(erro);
+    Serial.print(" | ME: ");
+    Serial.print(motorEsquerdo);
+    Serial.print(" | MD: ");
+    Serial.print(motorDireito);
+    Serial.print(" | Marcas: ");
+    Serial.println(contadorMarcas);
+  }
+}
+
+
+// =============================
+// MOTOR A
+// =============================
+
+void moverMotorA(int velocidade) {
+  if (velocidade > 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, velocidade);
+  } else if (velocidade < 0) {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    analogWrite(PWMA, -velocidade);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, 0);
+  }
+}
+
+
+// =============================
+// MOTOR B
+// =============================
+
+void moverMotorB(int velocidade) {
+  if (velocidade > 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, velocidade);
+  } else if (velocidade < 0) {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    analogWrite(PWMB, -velocidade);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, 0);
+  }
+}
+
+
+// =============================
+// PARAR
+// =============================
+
+void parar() {
+  moverMotorA(0);
+  moverMotorB(0);
+}
